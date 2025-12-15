@@ -49,7 +49,9 @@ results/
 *.png
 *.jpg
 *.jpeg
-!assets/
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
 
 # Testing
 .pytest_cache/
