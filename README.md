@@ -1,19 +1,32 @@
-# AI Roof Damage Detection & Estimation System
+# AI Roof Damage Detection System
 
-Production-ready system for automated roof damage detection from satellite imagery using computer vision (YOLOv8-seg).
+Automated roof damage detection from satellite imagery using YOLOv8-segmentation models. Input a US zipcode to fetch satellite images, detect roofs, and identify damage with visual annotations.
+
+![Detection Example](assets/images/detection_example.png)
+
+## Features
+
+- **Satellite Image Fetching**: Retrieves high-resolution satellite imagery from MapTiler API for any US zipcode
+- **Roof Detection**: Uses YOLOv8-segmentation to identify and segment roof boundaries
+- **Damage Detection**: Detects and classifies roof damage with severity scoring
+- **Image Enhancement**: Applies CLAHE, sharpening, and denoising for better model visibility
+- **Visual Output**: Generates annotated images and heatmaps showing detected roofs and damage
+- **JSON/GeoJSON Export**: Structured output for integration with mapping tools
+- **FastAPI Endpoint**: RESTful API for programmatic access
+- **Performance Profiling**: Built-in performance metrics and timing analysis
 
 ## Quick Start
 
-### 1. Setup Environment
+### 1. Setup
 
 ```bash
-# Clone and enter directory
+# Clone repository
 cd AI_Roof_Damage_Detection
 
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+venv\Scripts\activate  # Windows
+# or: source venv/bin/activate  # Linux/Mac
 
 # Install dependencies
 pip install -r requirements.txt
@@ -21,172 +34,93 @@ pip install -r requirements.txt
 
 ### 2. Configure API Key
 
-Create a `.env` file:
+Create a `.env` file in the project root:
 
 ```bash
-GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
+MAPTILER_API_KEY=your_maptiler_api_key_here
 ```
 
-### 3. Run Analysis
+Get your free API key from [MapTiler](https://www.maptiler.com/cloud/).
 
-**CLI Mode:**
+### 3. Download Models
+
+Run the model download script:
+
 ```bash
-python main.py analyze 75201 --output ./output
+python scripts/download_mvp_models.py
 ```
 
-**API Mode:**
+This downloads pre-trained YOLOv8 models for roof and damage detection from Hugging Face.
+
+### 4. Run Analysis
+
+**Test Script:**
 ```bash
-python main.py serve --port 8000
-# API docs at: http://localhost:8000/docs
+python test_zipcode.py
 ```
 
-### 4. API Usage
+Edit `test_zipcode.py` to change the zipcode.
 
+**API Server:**
 ```bash
-# Analyze a zipcode
+python -m uvicorn api.main:app --reload
+```
+
+Visit `http://localhost:8000/docs` for interactive API documentation.
+
+**API Request:**
+```bash
 curl -X POST "http://localhost:8000/api/v1/analyze" \
   -H "Content-Type: application/json" \
   -d '{"zipcode": "75201"}'
 ```
 
-## Project Overview
+## Output
 
-End-to-end pipeline that processes satellite imagery to detect roofs and damage:
+Results are saved in the `output/` directory:
 
-## Core Features
-
-### 1. Image Ingestion Pipeline
-- **Multi-source support**: Google, Bing, Mapbox, ESRI, Nearmap, SkyFi, drone uploads
-- **Geospatial processing**: GDAL/Rasterio for orthorectification, georeferencing, reprojection
-- **Quality checks**: Cloud cover detection, angle validation, resolution checks
-- **Output**: Standardized, geospatial-ready mosaics
-
-### 2. Roof Segmentation & Structure Extraction
-- **SAM-based segmentation**: Initial roof mask generation
-- **Post-processing**: OpenCV contours, morphological operations
-- **Vector conversion**: Shapely polygons with simplification and smoothing
-- **Pitch estimation**: Shadow geometry + solar angle metadata
-- **Output**: JSON + GeoJSON of roof boundaries, planes, edges, pitch estimates
-
-### 3. Damage Detection (Ensemble Approach)
-- **YOLOv8/YOLOv9**: Custom-trained model for damage classes
-  - Hail impact, missing shingles, ponding, membrane damage
-  - Flashing anomalies, cracks, blisters, warping
-- **OpenAI Vision**: Secondary verifier to reduce false positives
-- **SAM masks**: Pixel-accurate damage isolation
-- **Multi-temporal analysis**: Before/after event comparison
-- **Confidence scoring**: Uncertainty quantification, auto-flagging for review
-- **Output**: Severity-scored heatmaps with confidence scores
-
-### 4. Measurement Engine
-- **Area calculation**: Roof plane polygons + pitch values
-- **Surface area**: Pitch-adjusted calculations
-- **Perimeter & materials**: Multi-plane geometry processing
-- **Output**: Per-plane measurements, total areas, waste factors, material breakdown
-
-### 5. Cost Estimation Engine
-- **Rule-based pricing**: Structured JSON pricing tables
-- **Repair vs replacement**: Logic-based decision making
-- **Per-plane differentiation**: Material-specific costs
-- **Waste adjustment**: Labor scaling factors
-- **PDF generation**: WeasyPrint with HTML templates
-- **Output**: Structured JSON + downloadable PDF proposals
-
-### 6. Property Owner Identification
-- **County data extraction**: Automated appraisal district scraping/API
-- **Data enrichment**: Dropcontact, Clay, Apollo integration
-- **Decision-maker identification**: LinkedIn/Google Places lookup
-- **Multi-source verification**: Cross-checking for accuracy
-- **Fuzzy matching**: Name variations, LLCs, trusts, property management
-- **Output**: Owner information, mailing addresses, property type, decision-maker roles
-
-### 7. GoHighLevel Integration
-- **API sync**: Contacts, damage reports, PDFs, images, metadata
-- **Pipeline automation**: Stage updates, task creation, tagging
-- **Webhook triggers**: Automated follow-up based on severity scores
-- **Smart sequencing**: High-severity → immediate outreach, low-severity → nurture sequence
-- **Multi-channel**: Email → phone → SMS → LinkedIn escalation
+- `{zipcode}_{timestamp}_annotated.png` - Visualized detections with masks and labels
+- `{zipcode}_{timestamp}_heatmap.png` - Damage severity heatmap
+- `{zipcode}_{timestamp}.json` - Structured detection results
+- `{zipcode}_{timestamp}.geojson` - Geographic data for mapping tools
 
 ## Technical Stack
 
-- **Languages**: Python 3.10+
-- **ML Framework**: PyTorch, YOLOv8/YOLOv9, SAM (Segment Anything Model)
-- **APIs**: OpenAI Vision API, GoHighLevel API
-- **Geospatial**: GDAL, Rasterio, Shapely, GeoJSON
-- **Image Processing**: OpenCV, PIL/Pillow
-- **Web Framework**: FastAPI
-- **Storage**: S3-compatible, PostgreSQL
-- **PDF Generation**: WeasyPrint
-- **Data Enrichment**: Dropcontact, Clay, Apollo, LinkedIn Sales Navigator
+- **Python 3.10+**
+- **YOLOv8** (Ultralytics) - Segmentation models
+- **PyTorch** - Deep learning framework
+- **FastAPI** - Web framework
+- **MapTiler API** - Satellite imagery
+- **OpenCV** - Image processing
+- **Shapely** - Geometric operations
+- **Pydantic** - Data validation
 
-## Accuracy Targets
+## Architecture
 
-- **Damage Detection**: 85-92% precision, <8% false positives
-- **Property Owner ID**: 75-85% accuracy
-- **Decision-Maker Enrichment**: 60-70% accuracy (varies by county data quality)
+1. **Geocoding**: Converts zipcode to bounding box coordinates
+2. **Image Fetching**: Downloads satellite tiles from MapTiler at zoom level 21
+3. **Image Stitching**: Combines tiles into a single image
+4. **Image Enhancement**: Improves visibility with CLAHE, sharpening, denoising
+5. **Roof Detection**: YOLOv8-seg identifies roof boundaries
+6. **Damage Detection**: YOLOv8-seg detects damage within roof regions
+7. **Visualization**: Generates annotated images and heatmaps
+8. **Export**: Saves JSON and GeoJSON results
 
-## Implementation Plan
+## Models
 
-### Phase 1: Foundation (Weeks 1-2)
-- [ ] Image ingestion pipeline (multi-source support)
-- [ ] Geospatial processing (GDAL/Rasterio)
-- [ ] Quality checks (cloud, angle, resolution)
-- [ ] SAM integration for roof segmentation
+- **Roof Detector**: `keremberke/yolov8m-building-segmentation` (Hugging Face)
+- **Damage Detector**: `JGuevara-12/yolo-roof-damage` (Hugging Face)
 
-### Phase 2: Damage Detection (Weeks 3-4)
-- [ ] YOLOv8/YOLOv9 model training on damage dataset
-- [ ] OpenAI Vision integration for verification
-- [ ] Multi-temporal analysis pipeline
-- [ ] Confidence scoring & uncertainty quantification
-- [ ] Ensemble approach (YOLO + OpenAI agreement logic)
+Models are automatically downloaded to `models/` directory on first run.
 
-### Phase 3: Measurement & Estimation (Weeks 5-6)
-- [ ] Roof measurement engine (Shapely geometry)
-- [ ] Pitch-adjusted calculations
-- [ ] Cost estimation logic (rule-based pricing)
-- [ ] PDF proposal generation (WeasyPrint)
+## Memory Optimization
 
-### Phase 4: Property Identification (Weeks 7-8)
-- [ ] County data extraction (scraping/API)
-- [ ] Data enrichment (Dropcontact, Clay, Apollo)
-- [ ] Decision-maker identification (LinkedIn, Google Places)
-- [ ] Multi-source verification & fuzzy matching
+- Lazy model loading
+- Image chunking for large areas
+- Selective mask storage (polygons for large images)
+- Automatic garbage collection and CUDA cache clearing
+- Memory-efficient batch processing
 
-### Phase 5: Integration & Automation (Weeks 9-10)
-- [ ] GoHighLevel API integration
-- [ ] Webhook triggers for automated workflows
-- [ ] Smart sequencing (severity-based outreach)
-- [ ] Multi-channel enrichment pipeline
+## License
 
-### Phase 6: Optimization & Learning (Weeks 11-12)
-- [ ] Incremental learning pipeline
-- [ ] Active learning (user corrections → model updates)
-- [ ] A/B testing for enrichment sources
-- [ ] Performance tracking & accuracy monitoring
-
-## Key Improvements & Differentiators
-
-1. **Multi-temporal Analysis**: Before/after event comparison reduces false positives
-2. **Uncertainty Quantification**: Confidence scores flag low-confidence cases for review
-3. **Incremental Learning**: System improves from user corrections
-4. **Context-Aware Filtering**: Adjusts thresholds by roof material, spatial validation
-5. **Active Learning**: Incorrect detections improve future predictions
-6. **Smart Sequencing**: Automated workflow triggers based on severity
-7. **Multi-source Verification**: Cross-checking improves owner identification accuracy
-
-## Deliverables
-
-- Production-ready Python codebase
-- Trained YOLO model weights
-- API endpoints (FastAPI)
-- GoHighLevel integration module
-- Documentation & deployment guides
-- Test datasets & validation results
-
-## Next Steps
-
-1. Set up project structure
-2. Initialize image ingestion pipeline
-3. Prepare training dataset for YOLO model
-4. Begin SAM integration for roof segmentation
-
+See LICENSE file for details.
