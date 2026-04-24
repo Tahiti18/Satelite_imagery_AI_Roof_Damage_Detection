@@ -20,17 +20,20 @@ from .detection import RoofDetector, DamageDetector
 from .output import ResultGenerator, AnalysisResult, Visualizer
 
 
+RAILWAY_SAFE_ZOOM_LEVEL = 17
+
+
 @dataclass
 class PipelineConfig:
     """Pipeline configuration."""
 
-    # Image fetching
+    # Image fetching - Railway-safe defaults
     tile_size: int = 256
-    zoom_level: int = 21
-    max_concurrent_downloads: int = 10
+    zoom_level: int = RAILWAY_SAFE_ZOOM_LEVEL
+    max_concurrent_downloads: int = 5
     tile_overlap: float = 0.0
     use_cache: bool = True
-    cache_dir: str = "./cache/tiles"
+    cache_dir: str = "/tmp/tiles"
 
     # Detection
     roof_confidence: float = 0.2
@@ -39,7 +42,7 @@ class PipelineConfig:
     min_damage_area: int = 25
 
     # Output
-    output_dir: str = "./output"
+    output_dir: str = "/tmp/output"
     save_visualization: bool = True
     save_heatmap: bool = True
     save_json: bool = True
@@ -65,16 +68,21 @@ class RoofDamagePipeline:
         config: Optional[PipelineConfig] = None,
         device: Optional[str] = None,
     ):
-        """
-        Initialize pipeline.
-
-        Args:
-            api_key: MapTiler API key
-            config: Pipeline configuration
-            device: Device for inference ('cuda', 'cpu', or None for auto)
-        """
         self.config = config or PipelineConfig()
         self.device = device
+
+        # Hard safety guard: never allow zoom 21 in this Railway deployment.
+        if self.config.zoom_level > RAILWAY_SAFE_ZOOM_LEVEL:
+            logger.warning(
+                f"Requested zoom_level={self.config.zoom_level}; "
+                f"forcing zoom_level={RAILWAY_SAFE_ZOOM_LEVEL} for Railway stability."
+            )
+            self.config.zoom_level = RAILWAY_SAFE_ZOOM_LEVEL
+
+        self.config.tile_size = 256
+        self.config.max_concurrent_downloads = min(self.config.max_concurrent_downloads, 5)
+        self.config.cache_dir = "/tmp/tiles"
+        self.config.output_dir = "/tmp/output"
 
         self._geocoder: Optional[ZipcodeGeocoder] = None
         self._fetcher: Optional[SatelliteImageFetcher] = None
@@ -88,8 +96,12 @@ class RoofDamagePipeline:
         self._initialized = False
 
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.config.cache_dir).mkdir(parents=True, exist_ok=True)
 
-        logger.info("RoofDamagePipeline created")
+        logger.info(
+            f"RoofDamagePipeline created "
+            f"(zoom={self.config.zoom_level}, tile_size={self.config.tile_size})"
+        )
 
     async def _initialize(self) -> None:
         """Lazy initialization of components."""
@@ -100,14 +112,18 @@ class RoofDamagePipeline:
 
         self._geocoder = ZipcodeGeocoder()
 
+        forced_zoom = RAILWAY_SAFE_ZOOM_LEVEL
+
         self._fetcher = SatelliteImageFetcher(
             api_key=self._api_key,
-            tile_size=self.config.tile_size,
-            zoom=self.config.zoom_level,
-            max_concurrent=self.config.max_concurrent_downloads,
-            requests_per_second=10,
+            tile_size=256,
+            zoom=forced_zoom,
+            max_concurrent=5,
+            requests_per_second=5,
             cache_dir=self.config.cache_dir if self.config.use_cache else None,
         )
+
+        logger.info(f"SatelliteImageFetcher initialized with forced zoom={forced_zoom}")
 
         self._stitcher = ImageStitcher()
 
@@ -154,16 +170,6 @@ class RoofDamagePipeline:
         zipcode: str,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> AnalysisResult:
-        """
-        Analyze all roofs in a zipcode for damage.
-
-        Args:
-            zipcode: US zipcode, normally 5 digits
-            progress_callback: Optional callback(stage, progress_percent)
-
-        Returns:
-            AnalysisResult with detections and performance data.
-        """
         start_time = time.time()
         profiler = PerformanceProfiler()
         metrics = ProcessingMetrics(zipcode=zipcode)
@@ -184,7 +190,6 @@ class RoofDamagePipeline:
                 progress_callback(stage, progress)
             logger.debug(f"{stage}: {progress:.0%}")
 
-        # Stage 1: Geocode zipcode
         report_progress("Geocoding", 0.0)
         geocode_start = time.perf_counter()
 
@@ -197,7 +202,6 @@ class RoofDamagePipeline:
 
         report_progress("Geocoding", 1.0)
 
-        # Stage 2: Fetch satellite images
         report_progress("Fetching images", 0.0)
 
         with profiler.profile("fetch_tiles"):
@@ -220,7 +224,6 @@ class RoofDamagePipeline:
 
         get_memory_manager().cleanup()
 
-        # Stage 3: Stitch images
         report_progress("Stitching images", 0.0)
 
         with profiler.profile("stitch"):
@@ -240,7 +243,6 @@ class RoofDamagePipeline:
 
         get_memory_manager().cleanup_intermediate_data(tiles)
 
-        # Stage 4: Detect roofs
         report_progress("Detecting roofs", 0.0)
 
         with profiler.profile("detect_roofs"):
@@ -254,7 +256,6 @@ class RoofDamagePipeline:
 
         get_memory_manager().cleanup()
 
-        # Stage 5: Detect damage on each roof
         report_progress("Detecting damage", 0.0)
 
         all_damages = []
@@ -284,7 +285,6 @@ class RoofDamagePipeline:
 
             metrics.mark_stage("detect_damage", time.perf_counter() - damage_start)
 
-        # Stage 6: Generate results
         report_progress("Generating results", 0.0)
 
         processing_time = time.time() - start_time
@@ -349,18 +349,6 @@ def analyze_zipcode_sync(
     api_key: str,
     config: Optional[PipelineConfig] = None,
 ) -> AnalysisResult:
-    """
-    Synchronous wrapper for analyze_zipcode.
-
-    Args:
-        zipcode: US zipcode
-        api_key: MapTiler API key
-        config: Optional pipeline configuration
-
-    Returns:
-        AnalysisResult
-    """
-
     async def _run() -> AnalysisResult:
         pipeline = RoofDamagePipeline(api_key=api_key, config=config)
         try:
