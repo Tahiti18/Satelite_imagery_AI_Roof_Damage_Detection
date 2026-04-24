@@ -1,36 +1,36 @@
 # Core
-python-dotenv>=1.0.0
-pyyaml>=6.0.1
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
+python-dotenv==1.0.1
+pyyaml==6.0.2
+pydantic==2.8.2
+pydantic-settings==2.4.0
 
 # Web Framework
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-httpx>=0.25.0
-aiohttp>=3.9.0
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+httpx==0.27.2
+aiohttp==3.10.5
 
 # ML/CV
-# torch and torchvision are installed separately in Dockerfile as CPU-only wheels
-ultralytics>=8.0.0
-opencv-python-headless>=4.8.0,<4.10.0
-pillow>=10.0.0
-numpy>=1.24.0,<2.0.0
+# torch and torchvision are installed separately in Dockerfile as CPU-only wheels.
+numpy==1.26.4
+ultralytics==8.2.103
+opencv-python-headless==4.9.0.80
+pillow==10.4.0
 
 # Geospatial
-shapely>=2.0.0
-pyproj>=3.0.0
+shapely==2.0.6
+pyproj==3.6.1
 
 # Data Processing
-pandas>=2.0.0
-orjson>=3.9.0
+pandas==2.2.2
+orjson==3.10.7
 
 # Logging & Monitoring
-loguru>=0.7.0
+loguru==0.7.2
 
 # Security
-cryptography>=41.0.0
+cryptography==43.0.1
 
 # Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
+pytest==8.3.2
+pytest-asyncio==0.24.0
