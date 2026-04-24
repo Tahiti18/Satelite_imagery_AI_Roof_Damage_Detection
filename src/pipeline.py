@@ -1,340 +1,659 @@
 """
-Main pipeline orchestration.
-Coordinates all components for zipcode-based roof damage detection.
+Output generation and visualization utilities for the roof damage pipeline.
+
+This module is intentionally compatible with src.pipeline.RoofDamagePipeline.
+It provides:
+- AnalysisResult dataclass
+- ResultGenerator for JSON / GeoJSON output
+- Visualizer for annotated images and damage heatmaps
 """
-import asyncio
+
+from __future__ import annotations
+
+import json
 import time
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
-from .utils.memory import memory_efficient, get_memory_manager
-from .utils.logger import setup_logger
-from .utils.perf import PerformanceProfiler, ProcessingMetrics
-from .image_ingestion import ZipcodeGeocoder, SatelliteImageFetcher, ImageStitcher, ZipcodeInfo
-from .detection import RoofDetector, DamageDetector, RoofDetection, DamageDetection
-from .output import ResultGenerator, AnalysisResult, Visualizer
-from config.settings import Settings, get_settings
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
 
 
 @dataclass
-class PipelineConfig:
-    """Pipeline configuration."""
-    # Image fetching - OPTIMIZED FOR MAXIMUM ACCURACY
-    tile_size: int = 256  # MapTiler standard tile size
-    zoom_level: int = 21  # MAXIMUM zoom for closest view (0.075m/pixel - can see individual roof tiles)
-    max_concurrent_downloads: int = 10  # Conservative to avoid API throttling
-    tile_overlap: float = 0.0  # NO overlap - fetch exact area only
-    use_cache: bool = True
-    cache_dir: str = "./cache/tiles"
-    
-    # Detection - OPTIMIZED FOR ACCURACY
-    roof_confidence: float = 0.2  # Lower threshold for better detection
-    damage_confidence: float = 0.25  # Lower threshold for damage detection
-    min_roof_area: int = 100
-    min_damage_area: int = 25
-    
-    # Output
-    output_dir: str = "./output"
-    save_visualization: bool = True
-    save_heatmap: bool = True
-    save_json: bool = True
-    save_geojson: bool = True
-    
-    # Models
-    roof_model_path: Optional[str] = None
-    damage_model_path: Optional[str] = None
+class DamageSummary:
+    """Summary of detected roof damage."""
+    total_damage_instances: int = 0
+    damage_types: Dict[str, int] = field(default_factory=dict)
+    average_confidence: float = 0.0
+    max_confidence: float = 0.0
 
 
-class RoofDamagePipeline:
-    """
-    Main pipeline for zipcode-based roof damage detection.
-    
-    Usage:
-        pipeline = RoofDamagePipeline(api_key="YOUR_KEY")
-        result = await pipeline.analyze_zipcode("75201")
-    """
-    
-    def __init__(
+@dataclass
+class AnalysisResult:
+    """Structured result returned by the roof damage pipeline."""
+    zipcode: str
+    city: Optional[str] = None
+    state: Optional[str] = None
+    center_lat: Optional[float] = None
+    center_lng: Optional[float] = None
+    bounding_box: Optional[Dict[str, float]] = None
+
+    total_roofs: int = 0
+    roofs_with_damage: int = 0
+    total_damages: int = 0
+    damage_summary: Dict[str, Any] = field(default_factory=dict)
+
+    roofs: List[Dict[str, Any]] = field(default_factory=list)
+    damages: List[Dict[str, Any]] = field(default_factory=list)
+
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    tiles_processed: Optional[int] = None
+    processing_time: Optional[float] = None
+    performance_metrics: Dict[str, Any] = field(default_factory=dict)
+
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+
+class ResultGenerator:
+    """Creates and saves structured pipeline results."""
+
+    def __init__(self, output_dir: str | Path = "./output") -> None:
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def create_result(
         self,
-        api_key: str,
-        config: Optional[PipelineConfig] = None,
-        device: Optional[str] = None
-    ):
-        """
-        Initialize pipeline.
-        
-        Args:
-            api_key: MapTiler API key
-            config: Pipeline configuration
-            device: Device for inference ('cuda', 'cpu', or None for auto)
-        """
-        self.config = config or PipelineConfig()
-        self.device = device
-        
-        # Initialize components (lazy loaded)
-        self._geocoder: Optional[ZipcodeGeocoder] = None
-        self._fetcher: Optional[SatelliteImageFetcher] = None
-        self._stitcher: Optional[ImageStitcher] = None
-        self._roof_detector: Optional[RoofDetector] = None
-        self._damage_detector: Optional[DamageDetector] = None
-        self._result_generator: Optional[ResultGenerator] = None
-        self._visualizer: Optional[Visualizer] = None
-        
-        self._api_key = api_key
-        self._initialized = False
-        
-        # Create output directory
-        Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
-        
-        logger.info("RoofDamagePipeline created")
-    
-    async def _initialize(self) -> None:
-        """Lazy initialization of components."""
-        if self._initialized:
-            return
-        
-        logger.info("Initializing pipeline components...")
-        
-        # Initialize geocoder
-        self._geocoder = ZipcodeGeocoder()
-        
-        # Initialize image fetcher - OPTIMIZED FOR ACCURACY
-        self._fetcher = SatelliteImageFetcher(
-            api_key=self._api_key,
-            tile_size=self.config.tile_size,
-            zoom=self.config.zoom_level,
-            max_concurrent=self.config.max_concurrent_downloads,
-            requests_per_second=10,  # Rate limit: 10 req/sec (safe for API)
-            cache_dir=self.config.cache_dir if self.config.use_cache else None
-        )
-        
-        # Initialize stitcher
-        self._stitcher = ImageStitcher()
-        
-        # Initialize detectors
-        self._roof_detector = RoofDetector(
-            model_path=self.config.roof_model_path,
-            confidence_threshold=self.config.roof_confidence,
-            min_area_pixels=self.config.min_roof_area,
-            device=self.device
-        )
-        
-        self._damage_detector = DamageDetector(
-            model_path=self.config.damage_model_path,
-            confidence_threshold=self.config.damage_confidence,
-            min_area_pixels=self.config.min_damage_area,
-            device=self.device
-        )
-        
-        # Initialize output generators
-        self._result_generator = ResultGenerator()
-        self._visualizer = Visualizer()
-        
-        self._initialized = True
-        logger.info("Pipeline initialized")
-    
-    async def close(self) -> None:
-        """Cleanup resources."""
-        if self._geocoder:
-            await self._geocoder.close()
-        if self._fetcher:
-            await self._fetcher.close()
-        if self._roof_detector:
-            self._roof_detector.unload_model()
-        if self._damage_detector:
-            self._damage_detector.unload_model()
-        
-        get_memory_manager().cleanup(force=True)
-        logger.info("Pipeline closed")
-    
-    @memory_efficient(cleanup_after=True)
-    async def analyze_zipcode(
-        self,
-        zipcode: str,
-        progress_callback: Optional[Callable[[str, float], None]] = None
+        zipcode_info: Any,
+        roofs: Sequence[Any],
+        damages: Sequence[Any],
+        image_width: int,
+        image_height: int,
+        tiles_processed: int,
+        processing_time: float,
+        performance_metrics: Optional[Dict[str, Any]] = None,
     ) -> AnalysisResult:
-        """
-        Analyze all roofs in a zipcode for damage.
-        
-        This method coordinates the complete pipeline:
-        geocoding, image fetching, stitching, detection
-        and result generation. Performance metrics are
-        collected for each major stage to help identify
-        bottlenecks.
-        
-        Args:
-            zipcode: US zipcode (5 digits)
-            progress_callback: Optional callback(stage, progress_percent)
-            
-        Returns:
-            AnalysisResult with all detections and performance data.
-        """
-        start_time = time.time()
-        profiler = PerformanceProfiler()
-        metrics = ProcessingMetrics(zipcode=zipcode)
-        
-        # Initialize if needed
-        with profiler.profile("initialize"):
-            await self._initialize()
-        
-        def report_progress(stage: str, progress: float):
-            if progress_callback:
-                progress_callback(stage, progress)
-            logger.debug(f"{stage}: {progress:.0%}")
-        
-        # Stage 1: Geocode zipcode
-        report_progress("Geocoding", 0.0)
-        geocode_start = time.perf_counter()
-        zipcode_info = await self._geocoder.geocode_zipcode(zipcode)
-        metrics.mark_stage("geocoding", time.perf_counter() - geocode_start)
-        if zipcode_info is None:
-            raise ValueError(f"Invalid zipcode: {zipcode}")
-        report_progress("Geocoding", 1.0)
-        
-        # Stage 2: Fetch satellite images - EXACT AREA ONLY (no overlap)
-        report_progress("Fetching images", 0.0)
-        with profiler.profile("fetch_tiles"):
-            fetch_start = time.perf_counter()
-            tiles = await self._fetcher.fetch_area(
-                zipcode_info.bounding_box,
-                use_cache=self.config.use_cache,
-                overlap_percent=self.config.tile_overlap,  # 0.0 = exact area, no overlap
-                progress_callback=lambda done, total: report_progress("Fetching images", done/total)
-            )
-            metrics.mark_stage("fetch_tiles", time.perf_counter() - fetch_start)
-        
-        if not tiles:
-            raise RuntimeError("Failed to fetch satellite imagery")
-        
-        # Memory cleanup after fetching
-        get_memory_manager().cleanup()
-        
-        # Stage 3: Stitch images
-        report_progress("Stitching images", 0.0)
-        with profiler.profile("stitch"):
-            stitch_start = time.perf_counter()
-            stitched = self._stitcher.stitch(
-                tiles,
-                min_lat=zipcode_info.bounding_box.min_lat,
-                max_lat=zipcode_info.bounding_box.max_lat,
-                min_lng=zipcode_info.bounding_box.min_lng,
-                max_lng=zipcode_info.bounding_box.max_lng
-            )
-            metrics.mark_stage("stitch", time.perf_counter() - stitch_start)
-        report_progress("Stitching images", 1.0)
-        
-        # Cleanup tile data after stitching (keep only stitched image)
-        get_memory_manager().cleanup_intermediate_data(tiles)
-        
-        # Stage 4: Detect roofs
-        report_progress("Detecting roofs", 0.0)
-        with profiler.profile("detect_roofs"):
-            detect_roofs_start = time.perf_counter()
-            roofs = self._roof_detector.detect(stitched.image, return_masks=True)
-            metrics.mark_stage("detect_roofs", time.perf_counter() - detect_roofs_start)
-        report_progress("Detecting roofs", 1.0)
-        
-        # Memory cleanup after roof detection
-        get_memory_manager().cleanup()
-        
-        # Stage 5: Detect damage on each roof
-        report_progress("Detecting damage", 0.0)
-        all_damages = []
-        with profiler.profile("detect_damage"):
-            damage_start = time.perf_counter()
-            for i, roof in enumerate(roofs):
-                damages = self._damage_detector.detect_on_roof(
-                    stitched.image,
-                    roof,
-                    return_masks=True
-                )
-                # Cleanup after each roof to prevent memory buildup
-                if i % 10 == 0:  # Cleanup every 10 roofs
-                    get_memory_manager().cleanup()
-                all_damages.extend(damages)
-                report_progress("Detecting damage", (i + 1) / len(roofs) if roofs else 1.0)
-            metrics.mark_stage("detect_damage", time.perf_counter() - damage_start)
-        
-        # Stage 6: Generate results
-        report_progress("Generating results", 0.0)
-        processing_time = time.time() - start_time
-        metrics.end_time = time.time()
-        metrics.profiler_stats = profiler.get_stats()
-        
-        result = self._result_generator.create_result(
-            zipcode_info=zipcode_info,
-            roofs=roofs,
-            damages=all_damages,
-            image_width=stitched.width,
-            image_height=stitched.height,
-            tiles_processed=stitched.n_tiles,
+        roof_records = [self._object_to_record(r, index=i) for i, r in enumerate(roofs)]
+        damage_records = [self._object_to_record(d, index=i) for i, d in enumerate(damages)]
+
+        roof_ids_with_damage = set()
+        for damage in damages:
+            roof_id = getattr(damage, "roof_id", None)
+            if roof_id is not None:
+                roof_ids_with_damage.add(roof_id)
+
+        if not roof_ids_with_damage:
+            roof_ids_with_damage = self._infer_damaged_roofs(roofs, damages)
+
+        damage_summary = self._summarize_damages(damages)
+
+        bbox = getattr(zipcode_info, "bounding_box", None)
+        bbox_dict = None
+        if bbox is not None:
+            bbox_dict = {
+                "min_lat": getattr(bbox, "min_lat", None),
+                "max_lat": getattr(bbox, "max_lat", None),
+                "min_lng": getattr(bbox, "min_lng", None),
+                "max_lng": getattr(bbox, "max_lng", None),
+            }
+
+        return AnalysisResult(
+            zipcode=str(getattr(zipcode_info, "zipcode", "")),
+            city=getattr(zipcode_info, "city", None),
+            state=getattr(zipcode_info, "state", None),
+            center_lat=getattr(zipcode_info, "center_lat", None)
+            or getattr(zipcode_info, "lat", None)
+            or getattr(zipcode_info, "latitude", None),
+            center_lng=getattr(zipcode_info, "center_lng", None)
+            or getattr(zipcode_info, "lng", None)
+            or getattr(zipcode_info, "longitude", None),
+            bounding_box=bbox_dict,
+            total_roofs=len(roofs),
+            roofs_with_damage=len(roof_ids_with_damage),
+            total_damages=len(damages),
+            damage_summary=damage_summary,
+            roofs=roof_records,
+            damages=damage_records,
+            image_width=image_width,
+            image_height=image_height,
+            tiles_processed=tiles_processed,
             processing_time=processing_time,
-            performance_metrics=metrics.to_dict(),
+            performance_metrics=performance_metrics or {},
         )
-        
-        # Save outputs
-        output_base = Path(self.config.output_dir) / f"{zipcode}_{int(time.time())}"
-        
-        if self.config.save_json:
-            self._result_generator.save_json(result, f"{output_base}.json")
-        
-        if self.config.save_geojson:
-            self._result_generator.save_geojson(result, f"{output_base}.geojson")
-        
-        if self.config.save_visualization:
-            vis_image = self._visualizer.draw_all(
-                stitched.image, roofs, all_damages,
-                draw_masks=True, draw_boxes=True, draw_labels=False
-            )
-            vis_image = self._visualizer.add_summary_overlay(
-                vis_image,
-                result.total_roofs,
-                result.roofs_with_damage,
-                result.damage_summary
-            )
-            self._visualizer.save(vis_image, f"{output_base}_annotated.png")
-        
-        if self.config.save_heatmap and all_damages:
-            heatmap = self._visualizer.generate_heatmap(stitched.image, all_damages)
-            self._visualizer.save(heatmap, f"{output_base}_heatmap.png")
-        
-        report_progress("Complete", 1.0)
-        
-        logger.info(
-            f"Analysis complete for {zipcode}: "
-            f"{result.total_roofs} roofs, {len(all_damages)} damages, "
-            f"{processing_time:.1f}s"
-        )
-        
-        return result
 
+    def save_json(self, result: AnalysisResult, path: str | Path) -> str:
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(result.to_json(indent=2), encoding="utf-8")
+        logger.info(f"Saved JSON result to {output_path}")
+        return str(output_path)
 
-# Synchronous wrapper for simple usage
-def analyze_zipcode_sync(
-    zipcode: str,
-    api_key: str,
-    config: Optional[PipelineConfig] = None
-) -> AnalysisResult:
-    """
-    Synchronous wrapper for analyze_zipcode.
-    
-    Args:
-        zipcode: US zipcode
-        api_key: Google Maps API key
-        config: Optional pipeline configuration
-        
-    Returns:
-        AnalysisResult
-    """
-    async def _run():
-        pipeline = RoofDamagePipeline(api_key, config)
+    def save_geojson(self, result: AnalysisResult, path: str | Path) -> str:
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        features: List[Dict[str, Any]] = []
+
+        for roof in result.roofs:
+            feature = self._record_to_feature(roof, feature_type="roof")
+            if feature:
+                features.append(feature)
+
+        for damage in result.damages:
+            feature = self._record_to_feature(damage, feature_type="damage")
+            if feature:
+                features.append(feature)
+
+        geojson = {
+            "type": "FeatureCollection",
+            "properties": {
+                "zipcode": result.zipcode,
+                "city": result.city,
+                "state": result.state,
+                "total_roofs": result.total_roofs,
+                "roofs_with_damage": result.roofs_with_damage,
+                "total_damages": result.total_damages,
+                "created_at": result.created_at,
+            },
+            "features": features,
+        }
+
+        output_path.write_text(json.dumps(geojson, indent=2, default=str), encoding="utf-8")
+        logger.info(f"Saved GeoJSON result to {output_path}")
+        return str(output_path)
+
+    def _object_to_record(self, obj: Any, index: int = 0) -> Dict[str, Any]:
+        if isinstance(obj, dict):
+            record = dict(obj)
+            record.setdefault("index", index)
+            return self._json_safe(record)
+
+        record: Dict[str, Any] = {"index": index}
+
+        for attr in [
+            "id",
+            "roof_id",
+            "damage_id",
+            "class_id",
+            "class_name",
+            "label",
+            "confidence",
+            "score",
+            "bbox",
+            "box",
+            "polygon",
+            "points",
+            "area",
+            "area_pixels",
+            "centroid",
+            "mask_area",
+            "severity",
+            "damage_type",
+        ]:
+            if hasattr(obj, attr):
+                value = getattr(obj, attr)
+                record[attr] = self._json_safe(value)
+
+        if hasattr(obj, "__dict__"):
+            for key, value in obj.__dict__.items():
+                if key.startswith("_"):
+                    continue
+                if key not in record:
+                    record[key] = self._json_safe(value)
+
+        return record
+
+    def _json_safe(self, value: Any) -> Any:
+        if np is not None:
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, (np.integer,)):
+                return int(value)
+            if isinstance(value, (np.floating,)):
+                return float(value)
+            if isinstance(value, (np.bool_,)):
+                return bool(value)
+
+        if isinstance(value, Path):
+            return str(value)
+
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+
         try:
-            return await pipeline.analyze_zipcode(zipcode)
-        finally:
-            await pipeline.close()
-    
-    return asyncio.run(_run())
+            json.dumps(value)
+            return value
+        except Exception:
+            return str(value)
 
+    def _summarize_damages(self, damages: Sequence[Any]) -> Dict[str, Any]:
+        damage_types: Dict[str, int] = {}
+        confidences: List[float] = []
+
+        for damage in damages:
+            label = (
+                getattr(damage, "damage_type", None)
+                or getattr(damage, "class_name", None)
+                or getattr(damage, "label", None)
+                or "damage"
+            )
+            label = str(label)
+            damage_types[label] = damage_types.get(label, 0) + 1
+
+            confidence = getattr(damage, "confidence", None)
+            if confidence is None:
+                confidence = getattr(damage, "score", None)
+            if confidence is not None:
+                try:
+                    confidences.append(float(confidence))
+                except Exception:
+                    pass
+
+        return {
+            "total_damage_instances": len(damages),
+            "damage_types": damage_types,
+            "average_confidence": sum(confidences) / len(confidences) if confidences else 0.0,
+            "max_confidence": max(confidences) if confidences else 0.0,
+        }
+
+    def _infer_damaged_roofs(self, roofs: Sequence[Any], damages: Sequence[Any]) -> set:
+        damaged = set()
+
+        for i, roof in enumerate(roofs):
+            roof_bbox = self._get_bbox(roof)
+            if roof_bbox is None:
+                continue
+
+            for damage in damages:
+                damage_bbox = self._get_bbox(damage)
+                if damage_bbox is None:
+                    continue
+
+                if self._bbox_intersects(roof_bbox, damage_bbox):
+                    damaged.add(i)
+                    break
+
+        return damaged
+
+    def _get_bbox(self, obj: Any) -> Optional[Tuple[float, float, float, float]]:
+        bbox = None
+
+        if isinstance(obj, dict):
+            bbox = obj.get("bbox") or obj.get("box")
+        else:
+            bbox = getattr(obj, "bbox", None) or getattr(obj, "box", None)
+
+        if bbox is None or len(bbox) < 4:
+            return None
+
+        try:
+            return tuple(float(x) for x in bbox[:4])  # type: ignore
+        except Exception:
+            return None
+
+    def _bbox_intersects(
+        self,
+        a: Tuple[float, float, float, float],
+        b: Tuple[float, float, float, float],
+    ) -> bool:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+    def _record_to_feature(
+        self,
+        record: Dict[str, Any],
+        feature_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        geometry = record.get("geometry")
+
+        if geometry:
+            geom = geometry
+        else:
+            polygon = record.get("polygon") or record.get("points")
+            if polygon:
+                coords = [[list(p) for p in polygon]]
+                if coords[0] and coords[0][0] != coords[0][-1]:
+                    coords[0].append(coords[0][0])
+                geom = {"type": "Polygon", "coordinates": coords}
+            else:
+                bbox = record.get("bbox") or record.get("box")
+                if bbox and len(bbox) >= 4:
+                    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+                    geom = {
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [x1, y1],
+                            [x2, y1],
+                            [x2, y2],
+                            [x1, y2],
+                            [x1, y1],
+                        ]],
+                    }
+                else:
+                    return None
+
+        properties = {
+            k: v
+            for k, v in record.items()
+            if k not in {"geometry", "polygon", "points", "bbox", "box", "mask"}
+        }
+        properties["feature_type"] = feature_type
+
+        return {
+            "type": "Feature",
+            "geometry": geom,
+            "properties": properties,
+        }
+
+
+class Visualizer:
+    """Image annotation utilities for roofs and damage detections."""
+
+    def __init__(self, output_dir: str | Path = "./output") -> None:
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def draw_all(
+        self,
+        image: Any,
+        roofs: Sequence[Any],
+        damages: Sequence[Any],
+        draw_masks: bool = True,
+        draw_boxes: bool = True,
+        draw_labels: bool = False,
+    ) -> Any:
+        if cv2 is None or np is None:
+            logger.warning("OpenCV/numpy unavailable; returning image without visualization")
+            return image
+
+        vis = self._ensure_bgr_image(image)
+
+        for roof in roofs:
+            if draw_masks:
+                self._draw_mask(vis, roof, color=(0, 180, 255), alpha=0.25)
+            if draw_boxes:
+                self._draw_bbox(vis, roof, color=(0, 180, 255), label="roof" if draw_labels else None)
+            self._draw_polygon(vis, roof, color=(0, 180, 255))
+
+        for damage in damages:
+            if draw_masks:
+                self._draw_mask(vis, damage, color=(0, 0, 255), alpha=0.35)
+            if draw_boxes:
+                label = self._get_label(damage) if draw_labels else None
+                self._draw_bbox(vis, damage, color=(0, 0, 255), label=label)
+            self._draw_polygon(vis, damage, color=(0, 0, 255))
+
+        return vis
+
+    def add_summary_overlay(
+        self,
+        image: Any,
+        total_roofs: int,
+        roofs_with_damage: int,
+        damage_summary: Dict[str, Any],
+    ) -> Any:
+        if cv2 is None or np is None:
+            return image
+
+        vis = self._ensure_bgr_image(image)
+        overlay = vis.copy()
+
+        panel_h = 110
+        cv2.rectangle(overlay, (10, 10), (460, panel_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.55, vis, 0.45, 0, vis)
+
+        lines = [
+            f"Roofs detected: {total_roofs}",
+            f"Roofs with possible damage: {roofs_with_damage}",
+            f"Damage instances: {damage_summary.get('total_damage_instances', 0)}",
+            f"Avg confidence: {damage_summary.get('average_confidence', 0.0):.2f}",
+        ]
+
+        y = 35
+        for line in lines:
+            cv2.putText(
+                vis,
+                line,
+                (25, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            y += 22
+
+        return vis
+
+    def generate_heatmap(self, image: Any, damages: Sequence[Any]) -> Any:
+        if cv2 is None or np is None:
+            return image
+
+        base = self._ensure_bgr_image(image)
+        h, w = base.shape[:2]
+        heat = np.zeros((h, w), dtype=np.float32)
+
+        for damage in damages:
+            mask = self._get_mask(damage)
+            if mask is not None:
+                mask = self._resize_mask(mask, w, h)
+                heat += mask.astype(np.float32)
+                continue
+
+            bbox = self._get_bbox(damage)
+            if bbox:
+                x1, y1, x2, y2 = self._clip_bbox(bbox, w, h)
+                if x2 > x1 and y2 > y1:
+                    heat[y1:y2, x1:x2] += 1.0
+
+        if heat.max() > 0:
+            heat = heat / heat.max()
+            heat_uint8 = (heat * 255).astype(np.uint8)
+        else:
+            heat_uint8 = heat.astype(np.uint8)
+
+        heat_color = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)
+        blended = cv2.addWeighted(base, 0.65, heat_color, 0.35, 0)
+        return blended
+
+    def save(self, image: Any, path: str | Path) -> str:
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if cv2 is None:
+            raise RuntimeError("OpenCV is required to save visualization images")
+
+        img = self._ensure_bgr_image(image)
+        success = cv2.imwrite(str(output_path), img)
+
+        if not success:
+            raise RuntimeError(f"Failed to save image to {output_path}")
+
+        logger.info(f"Saved visualization to {output_path}")
+        return str(output_path)
+
+    def _ensure_bgr_image(self, image: Any) -> Any:
+        if cv2 is None or np is None:
+            return image
+
+        if isinstance(image, (str, Path)):
+            loaded = cv2.imread(str(image))
+            if loaded is None:
+                raise ValueError(f"Unable to read image: {image}")
+            return loaded
+
+        arr = image.copy() if hasattr(image, "copy") else np.array(image)
+
+        if len(arr.shape) == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+
+        if len(arr.shape) == 3 and arr.shape[2] == 4:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+
+        return arr
+
+    def _get_bbox(self, obj: Any) -> Optional[Tuple[float, float, float, float]]:
+        bbox = None
+
+        if isinstance(obj, dict):
+            bbox = obj.get("bbox") or obj.get("box")
+        else:
+            bbox = getattr(obj, "bbox", None) or getattr(obj, "box", None)
+
+        if bbox is None or len(bbox) < 4:
+            return None
+
+        try:
+            return tuple(float(v) for v in bbox[:4])  # type: ignore
+        except Exception:
+            return None
+
+    def _clip_bbox(
+        self,
+        bbox: Tuple[float, float, float, float],
+        width: int,
+        height: int,
+    ) -> Tuple[int, int, int, int]:
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(width - 1, int(x1)))
+        y1 = max(0, min(height - 1, int(y1)))
+        x2 = max(0, min(width - 1, int(x2)))
+        y2 = max(0, min(height - 1, int(y2)))
+        return x1, y1, x2, y2
+
+    def _draw_bbox(
+        self,
+        image: Any,
+        obj: Any,
+        color: Tuple[int, int, int],
+        label: Optional[str] = None,
+    ) -> None:
+        bbox = self._get_bbox(obj)
+        if not bbox:
+            return
+
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = self._clip_bbox(bbox, w, h)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+
+        if label:
+            cv2.putText(
+                image,
+                label,
+                (x1, max(18, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+    def _draw_polygon(
+        self,
+        image: Any,
+        obj: Any,
+        color: Tuple[int, int, int],
+    ) -> None:
+        polygon = None
+
+        if isinstance(obj, dict):
+            polygon = obj.get("polygon") or obj.get("points")
+        else:
+            polygon = getattr(obj, "polygon", None) or getattr(obj, "points", None)
+
+        if polygon is None:
+            return
+
+        try:
+            pts = np.array(polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(image, [pts], True, color, 2)
+        except Exception:
+            return
+
+    def _get_mask(self, obj: Any) -> Optional[Any]:
+        if isinstance(obj, dict):
+            return obj.get("mask")
+        return getattr(obj, "mask", None)
+
+    def _resize_mask(self, mask: Any, width: int, height: int) -> Any:
+        mask_arr = np.array(mask)
+
+        if mask_arr.ndim > 2:
+            mask_arr = mask_arr.squeeze()
+
+        if mask_arr.shape[0] != height or mask_arr.shape[1] != width:
+            mask_arr = cv2.resize(mask_arr.astype("float32"), (width, height))
+
+        return mask_arr > 0.5
+
+    def _draw_mask(
+        self,
+        image: Any,
+        obj: Any,
+        color: Tuple[int, int, int],
+        alpha: float = 0.3,
+    ) -> None:
+        mask = self._get_mask(obj)
+        if mask is None:
+            return
+
+        h, w = image.shape[:2]
+
+        try:
+            mask_arr = self._resize_mask(mask, w, h)
+        except Exception:
+            return
+
+        colored = np.zeros_like(image)
+        colored[:] = color
+
+        image[mask_arr] = cv2.addWeighted(
+            image[mask_arr],
+            1.0 - alpha,
+            colored[mask_arr],
+            alpha,
+            0,
+        )
+
+    def _get_label(self, obj: Any) -> str:
+        if isinstance(obj, dict):
+            label = (
+                obj.get("damage_type")
+                or obj.get("class_name")
+                or obj.get("label")
+                or "damage"
+            )
+            confidence = obj.get("confidence") or obj.get("score")
+        else:
+            label = (
+                getattr(obj, "damage_type", None)
+                or getattr(obj, "class_name", None)
+                or getattr(obj, "label", None)
+                or "damage"
+            )
+            confidence = getattr(obj, "confidence", None) or getattr(obj, "score", None)
+
+        if confidence is not None:
+            try:
+                return f"{label} {float(confidence):.2f}"
+            except Exception:
+                return str(label)
+
+        return str(label)
