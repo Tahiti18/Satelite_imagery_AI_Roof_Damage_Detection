@@ -1,16 +1,22 @@
 """
 FastAPI application for AI Roof Damage Detection.
-Supports zipcode analysis and exact-address analysis.
+Supports zipcode analysis, exact-address analysis, and output file downloads.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from loguru import logger
 
 from src.pipeline import RoofDamagePipeline, PipelineConfig
 from config.settings import get_settings
+
+
+OUTPUT_DIR = Path("/tmp/output")
 
 
 class AnalyzeZipcodeRequest(BaseModel):
@@ -51,13 +57,15 @@ def build_config(
     save_json: bool = True,
     save_geojson: bool = True,
 ) -> PipelineConfig:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     return PipelineConfig(
         tile_size=256,
         zoom_level=17,
         max_concurrent_downloads=5,
         roof_confidence=roof_confidence,
         damage_confidence=damage_confidence,
-        output_dir="/tmp/output",
+        output_dir=str(OUTPUT_DIR),
         cache_dir="/tmp/tiles",
         save_visualization=save_visualization,
         save_heatmap=save_heatmap,
@@ -87,6 +95,7 @@ async def root():
         "health": "/health",
         "analyze_zipcode": "/analyze",
         "analyze_address": "/analyze-address",
+        "outputs": "/outputs",
     }
 
 
@@ -151,3 +160,42 @@ async def analyze_address(request: AnalyzeAddressRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await pipeline.close()
+
+
+@app.get("/outputs")
+async def list_outputs():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(
+        [
+            {
+                "filename": path.name,
+                "size_bytes": path.stat().st_size,
+                "url": f"/outputs/{path.name}",
+                "full_url_hint": f"https://sateliteimageryairoofdamagedetection-production.up.railway.app/outputs/{path.name}",
+            }
+            for path in OUTPUT_DIR.iterdir()
+            if path.is_file()
+        ],
+        key=lambda item: item["filename"],
+        reverse=True,
+    )
+
+    return {
+        "count": len(files),
+        "files": files,
+    }
+
+
+@app.get("/outputs/{filename}")
+async def get_output_file(filename: str):
+    # Basic path traversal protection.
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    file_path = OUTPUT_DIR / filename
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    return FileResponse(file_path)
