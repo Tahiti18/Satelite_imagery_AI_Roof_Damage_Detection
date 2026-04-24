@@ -1,6 +1,6 @@
 # AI Roof Damage Detection System
 
-Automated roof damage detection from satellite imagery using YOLOv8-segmentation models. Input a US zipcode to fetch satellite images, detect roofs, and identify damage with visual annotations.
+Automated roof damage detection from satellite imagery using YOLOv8-segmentation models.Input a US zipcode to fetch satellite images, detect roofs, and identify damage with visual annotations.
 
 ![Detection Example](https://github.com/aaliyanahmed1/Satelite_imagery_AI_Roof_Damage_Detection/raw/main/assets/images/detection_example.png)
 
