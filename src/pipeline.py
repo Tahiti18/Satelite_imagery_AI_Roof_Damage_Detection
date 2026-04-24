@@ -20,16 +20,17 @@ from .detection import RoofDetector, DamageDetector
 from .output import ResultGenerator, AnalysisResult, Visualizer
 
 
-RAILWAY_SAFE_ZOOM_LEVEL = 17
+ZIP_SAFE_ZOOM_LEVEL = 17
+ADDRESS_SAFE_ZOOM_LEVEL = 19
 
 
 @dataclass
 class PipelineConfig:
     """Pipeline configuration."""
 
-    # Image fetching - Railway-safe defaults
+    # Image fetching
     tile_size: int = 256
-    zoom_level: int = RAILWAY_SAFE_ZOOM_LEVEL
+    zoom_level: int = ZIP_SAFE_ZOOM_LEVEL
     max_concurrent_downloads: int = 5
     tile_overlap: float = 0.0
     use_cache: bool = True
@@ -67,13 +68,13 @@ class RoofDamagePipeline:
         self.config = config or PipelineConfig()
         self.device = device
 
-        # Railway safety guard
-        if self.config.zoom_level > RAILWAY_SAFE_ZOOM_LEVEL:
+        # Default safety guard. ZIP mode should stay at 17 unless specifically changed internally.
+        if self.config.zoom_level > ZIP_SAFE_ZOOM_LEVEL:
             logger.warning(
-                f"Requested zoom_level={self.config.zoom_level}; "
-                f"forcing zoom_level={RAILWAY_SAFE_ZOOM_LEVEL}."
+                f"Requested initial zoom_level={self.config.zoom_level}; "
+                f"forcing initial zoom_level={ZIP_SAFE_ZOOM_LEVEL}."
             )
-            self.config.zoom_level = RAILWAY_SAFE_ZOOM_LEVEL
+            self.config.zoom_level = ZIP_SAFE_ZOOM_LEVEL
 
         self.config.tile_size = 256
         self.config.max_concurrent_downloads = min(self.config.max_concurrent_downloads, 5)
@@ -111,14 +112,14 @@ class RoofDamagePipeline:
         self._fetcher = SatelliteImageFetcher(
             api_key=self._api_key,
             tile_size=256,
-            zoom=RAILWAY_SAFE_ZOOM_LEVEL,
+            zoom=self.config.zoom_level,
             max_concurrent=5,
             requests_per_second=5,
             cache_dir=self.config.cache_dir if self.config.use_cache else None,
         )
 
         logger.info(
-            f"SatelliteImageFetcher initialized with forced zoom={RAILWAY_SAFE_ZOOM_LEVEL}"
+            f"SatelliteImageFetcher initialized with zoom={self.config.zoom_level}"
         )
 
         self._stitcher = ImageStitcher()
@@ -142,6 +143,24 @@ class RoofDamagePipeline:
 
         self._initialized = True
         logger.info("Pipeline initialized")
+
+    async def _reset_fetcher_for_zoom(self, zoom_level: int, mode_label: str) -> None:
+        """Recreate the image fetcher for a specific mode/zoom."""
+        self.config.zoom_level = zoom_level
+
+        if self._fetcher is not None:
+            await self._fetcher.close()
+
+        self._fetcher = SatelliteImageFetcher(
+            api_key=self._api_key,
+            tile_size=256,
+            zoom=zoom_level,
+            max_concurrent=5,
+            requests_per_second=5,
+            cache_dir=self.config.cache_dir if self.config.use_cache else None,
+        )
+
+        logger.info(f"{mode_label} using zoom={zoom_level}")
 
     async def close(self) -> None:
         """Cleanup resources."""
@@ -340,6 +359,8 @@ class RoofDamagePipeline:
 
         assert self._geocoder is not None
 
+        await self._reset_fetcher_for_zoom(ZIP_SAFE_ZOOM_LEVEL, "ZIP mode")
+
         report_progress = self._reporter(progress_callback)
 
         report_progress("Geocoding", 0.0)
@@ -376,6 +397,8 @@ class RoofDamagePipeline:
         await self._initialize()
 
         assert self._geocoder is not None
+
+        await self._reset_fetcher_for_zoom(ADDRESS_SAFE_ZOOM_LEVEL, "Address mode")
 
         report_progress = self._reporter(progress_callback)
 
